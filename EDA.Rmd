@@ -1,0 +1,381 @@
+---
+title: "EDA Notebook"
+author: "Shawal Fida"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load Libraries
+library(tidyverse)       # Data manipulation & visualization
+library(skimr)           # Data summary
+library(corrplot)        # Correlation heatmaps
+library(naniar)          # Missing data visualization
+library(janitor)         # Data cleaning
+
+```
+
+
+## Business Problem
+Home Credit Group aims to broaden financial inclusion for unbanked populations by providing a positive and safe borrowing experience. The key challenge is accurately predicting which loan applicants will be able to repay their loans. This prediction is critical because:
+
+1. Rejecting good applicants means lost business opportunities
+2. Approving high-risk applicants may lead to financial losses and increased default rates.
+3. Many potential customers lack conventional credit histories, making traditional scoring methods inadequate
+
+The company currently uses various statistical and machine learning methods to make these predictions but believes there's room for improvement. Our goal, and therefore the purpose of this notebook, is to develop a model that can more accurately identify which clients are capable of repayment, allowing Home Credit to make better-informed lending decisions.
+
+## Analytical Problem
+Customer repayment probability will be generated using a supervised machine-learning model. The model will use as inputs data collected on past customers such as application, demographic, and historical credit behavior. The model will use this information to predict the probability that the customers will either repay or not repay their loans. 
+
+## Description of the Data
+
+The dataset used in this project is `application_train.csv`, which contains **loan application records** from Home Credit. The dataset includes **demographic, financial, and credit-related attributes** of applicants. 
+
+Each row represents an **individual loan application**, with the `TARGET` variable indicating whether the applicant **defaulted on their loan** (`1`) or successfully repaid it (`0`).
+
+### 📊 **Key Features in the Dataset**
+The dataset consists of **308,000+ records and 122 columns**. Some of the most important features include:
+
+| **Feature Name**        | **Description** |
+|-------------------------|----------------|
+| `SK_ID_CURR`           | Unique ID for each loan application. |
+| `TARGET`               | Loan status (0 = Repaid, 1 = Defaulted). |
+| `NAME_CONTRACT_TYPE`   | Type of loan (Cash loans or Revolving loans). |
+| `CODE_GENDER`          | Gender of the applicant (M/F). |
+| `FLAG_OWN_CAR`         | Whether the applicant owns a car (Y/N). |
+| `FLAG_OWN_REALTY`      | Whether the applicant owns real estate (Y/N). |
+| `CNT_CHILDREN`         | Number of children the applicant has. |
+| `AMT_INCOME_TOTAL`     | Total annual income of the applicant. |
+| `AMT_CREDIT`          | Total loan credit amount. |
+| `AMT_ANNUITY`         | Annual loan repayment amount. |
+
+
+## Download Data and inspect
+
+```{r data loading, message = FALSE, warning = FALSE}
+
+application_train = read_csv("application_train.csv", col_names = TRUE, show_col_types = FALSE)
+application_test = read_csv("application_test.csv", col_names = TRUE, , show_col_types = FALSE)
+
+```
+
+## Dataset Structure and Summary
+
+```{r structure, message = FALSE, warning = FALSE, results = 'hide'}
+
+# Dataset structure
+str(application_train) 
+
+# Dataset summary
+summary(application_train) 
+
+```
+
+
+## Convert TARGET variable to a factor
+
+```{r factor target, message = FALSE, warning = FALSE}
+# Create a working copy of the dataset
+train <- application_train
+
+# Convert TARGET variable to a factor
+train$TARGET <- as.factor(train$TARGET)
+
+# Verify the conversion
+str(train$TARGET)
+table(train$TARGET)  # Check class distribution
+```
+
+
+## Check Missing Values 
+
+```{r missing values, message = FALSE, warning = FALSE}
+
+# Function to calculate missing values
+missing_values <- function(df) {
+  mis_val <- colSums(is.na(df))
+  mis_val_percent <- (mis_val / nrow(df)) * 100
+  mis_table <- data.frame(Feature = names(mis_val),
+                         Missing_Values = mis_val,
+                         Percentage = mis_val_percent) %>%
+    filter(Missing_Values > 0) %>%
+    arrange(desc(Percentage))
+  
+  return(mis_table)
+}
+
+# Check missing values
+train_missing <- missing_values(train)
+test_missing <- missing_values(application_test)
+head(train_missing, 10)  # Display top 10 features with missing values
+
+# Plot missing values (Top 20)
+missing_values(train) %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Feature, -Percentage), y = Percentage)) +
+  geom_bar(stat = "identity", fill = "red") +
+  coord_flip() +
+  labs(title = "Top 20 Features with Missing Values",
+       x = "Features",
+       y = "Percentage of Missing Values")
+
+```
+
+# Dropping columns with more than 60% missing values
+
+```{r drop values, message = FALSE, warning = FALSE}
+
+# Define threshold
+threshold <- 0.60  # 60% missing values threshold
+
+# Calculate missing values percentage
+missing_values_ratio <- colSums(is.na(train)) / nrow(train)
+missing_values_test_ratio <- colSums(is.na(application_test)) / nrow(application_test)
+
+# Select columns to keep (less than 60% missing values)
+train <- train[, missing_values_ratio < threshold]
+application_test <- application_test[, missing_values_test_ratio < threshold]
+
+# Print remaining columns
+cat("Number of remaining columns after dropping:", ncol(train), "\n")
+
+```
+
+
+# Handling remaining missing values
+
+```{r impute values, message = FALSE, warning = FALSE}
+
+# 1. Impute numeric columns with median
+num_cols <- names(train)[sapply(train, is.numeric)]
+num_cols_with_na <- names(which(sapply(train[num_cols], function(x) sum(is.na(x))) > 0))
+
+for (col in num_cols_with_na) {
+  med_val <- median(train[[col]], na.rm = TRUE)
+  train[[col]][is.na(train[[col]])] <- med_val
+}
+
+# Impute for test dataset
+num_cols_test <- names(application_test)[sapply(application_test, is.numeric)]
+num_cols_test_with_na <- names(which(sapply(application_test[num_cols_test], function(x) sum(is.na(x))) > 0))
+for (col in num_cols_test_with_na) {
+  med_val <- median(application_test[[col]], na.rm = TRUE)
+  application_test[[col]][is.na(application_test[[col]])] <- med_val
+}
+
+# 2. Impute categorical columns with most frequent value (mode)
+cat_cols <- names(train)[sapply(train, is.character) | sapply(train, is.factor)]
+cat_cols_with_na <- names(which(sapply(train[cat_cols], function(x) sum(is.na(x))) > 0))
+
+for (col in cat_cols_with_na) {
+  mode_val <- names(sort(table(train[[col]]), decreasing = TRUE))[1]
+  train[[col]][is.na(train[[col]])] <- mode_val
+}
+
+# Impute for testing dataset
+cat_cols_test <- names(application_test)[sapply(application_test, is.character) | sapply(application_test, is.factor)]
+cat_cols_test_with_na <- names(which(sapply(application_test[cat_cols_test], function(x) sum(is.na(x))) > 0))
+
+for (col in cat_cols_test_with_na) {
+  mode_val <- names(sort(table(application_test[[col]]), decreasing = TRUE))[1]
+  application_test[[col]][is.na(application_test[[col]])] <- mode_val
+}
+
+# Check if any missing values remain
+any_missing_train <- any(is.na(train))
+cat("Are there any missing values in train data?", any_missing_train, "\n")
+
+```
+
+## Outlier Analysis
+
+```{r outliers, message = FALSE, warning = FALSE}
+
+# Identify numeric columns (excluding ID and target variable)
+num_cols <- names(train)[sapply(train, is.numeric)]
+num_cols <- num_cols[!num_cols %in% c("SK_ID_CURR", "TARGET")]
+
+# Function to detect outliers using IQR method
+identify_outliers <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower_bound <- q1 - 1.5 * iqr
+  upper_bound <- q3 + 1.5 * iqr
+  return(list(
+    lower = lower_bound,
+    upper = upper_bound,
+    outliers = sum(x < lower_bound | x > upper_bound, na.rm = TRUE),
+    outlier_prop = sum(x < lower_bound | x > upper_bound, na.rm = TRUE) / length(x[!is.na(x)])
+  ))
+}
+
+# Calculate outliers for each numeric variable
+outlier_summary <- data.frame(
+  Feature = character(),
+  Lower_Bound = numeric(),
+  Upper_Bound = numeric(),
+  Outlier_Count = numeric(),
+  Outlier_Proportion = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (col in num_cols) {
+  if (length(unique(train[[col]])) > 1) { # Skip constant columns
+    outlier_info <- identify_outliers(train[[col]])
+    outlier_summary <- rbind(outlier_summary, data.frame(
+      Feature = col,
+      Lower_Bound = outlier_info$lower,
+      Upper_Bound = outlier_info$upper,
+      Outlier_Count = outlier_info$outliers,
+      Outlier_Proportion = outlier_info$outlier_prop,
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+# Sort by proportion of outliers
+outlier_summary <- outlier_summary %>% arrange(desc(Outlier_Proportion))
+
+# Display top variables with outliers
+head(outlier_summary, 10)
+
+# Visualize distributions of top variables with outliers
+for (i in 1:min(5, nrow(outlier_summary))) {
+  col_name <- outlier_summary$Feature[i]
+  p <- ggplot(train, aes(x = .data[[col_name]])) +
+    geom_histogram(fill = "blue", alpha = 0.7, bins = 30) +
+    geom_vline(xintercept = outlier_summary$Lower_Bound[i], color = "red", linetype = "dashed") +
+    geom_vline(xintercept = outlier_summary$Upper_Bound[i], color = "red", linetype = "dashed") +
+    labs(title = paste("Distribution of", col_name),
+         subtitle = "Red lines show outlier thresholds",
+         x = col_name,
+         y = "Count")
+  print(p)
+}
+```
+
+## Outliers handling
+
+```{r outlier handling, message = FALSE, warning = FALSE}
+# Strategy 1: Capping (Winsorization) for key financial variables
+key_financial_vars <- c("AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY", "AMT_GOODS_PRICE")
+
+for (col in key_financial_vars) {
+  if (col %in% names(train)) {
+    # Calculate outlier bounds
+    q1 <- quantile(train[[col]], 0.25, na.rm = TRUE)
+    q3 <- quantile(train[[col]], 0.75, na.rm = TRUE)
+    iqr <- q3 - q1
+    lower_bound <- q1 - 1.5 * iqr
+    upper_bound <- q3 + 1.5 * iqr
+    
+    # Count values outside bounds
+    n_lower <- sum(train[[col]] < lower_bound, na.rm = TRUE)
+    n_upper <- sum(train[[col]] > upper_bound, na.rm = TRUE)
+    
+    # Apply capping
+    train[[col]] <- ifelse(train[[col]] < lower_bound, lower_bound, train[[col]])
+    train[[col]] <- ifelse(train[[col]] > upper_bound, upper_bound, train[[col]])
+    
+    cat("Capped", col, "- Values below lower bound:", n_lower, 
+        "- Values above upper bound:", n_upper, "\n")
+  }
+}
+
+## Do the same for testing dataset
+for (col in key_financial_vars) {
+  if (col %in% names(application_test)) {
+    # Calculate outlier bounds
+    q1 <- quantile(application_test[[col]], 0.25, na.rm = TRUE)
+    q3 <- quantile(application_test[[col]], 0.75, na.rm = TRUE)
+    iqr <- q3 - q1
+    lower_bound <- q1 - 1.5 * iqr
+    upper_bound <- q3 + 1.5 * iqr
+    
+    # Count values outside bounds
+    n_lower <- sum(application_test[[col]] < lower_bound, na.rm = TRUE)
+    n_upper <- sum(application_test[[col]] > upper_bound, na.rm = TRUE)
+    
+    # Apply capping
+    application_test[[col]] <- ifelse(application_test[[col]] < lower_bound, lower_bound, train[[col]])
+    application_test[[col]] <- ifelse(application_test[[col]] > upper_bound, upper_bound, train[[col]])
+    
+    cat("Capped", col, "- Values below lower bound:", n_lower, 
+        "- Values above upper bound:", n_upper, "\n")
+  }
+}
+
+# Strategy 2: Create binary flags for significant outliers in other variables
+# Select variables with high outlier proportion (> 40%)
+high_outlier_vars <- outlier_summary$Feature[outlier_summary$Outlier_Proportion > 0.4 & 
+                                             !outlier_summary$Feature %in% key_financial_vars]
+
+# Create flags for these variables
+for (col in high_outlier_vars[1:10]) { # Limit to top 10 for efficiency
+  if (col %in% names(train)) {
+    # Get bounds from outlier summary
+    lower <- outlier_summary$Lower_Bound[outlier_summary$Feature == col]
+    upper <- outlier_summary$Upper_Bound[outlier_summary$Feature == col]
+    
+    # Create flag for outliers
+    flag_name <- paste0(col, "_OUTLIER")
+    train[[flag_name]] <- ifelse(train[[col]] < lower | train[[col]] > upper, 1, 0)
+    
+    cat("Created outlier flag for", col, "- Number of outliers:", sum(application_test[[flag_name]], na.rm = TRUE), "\n")
+  }
+}
+
+# do same for testing dataset
+for (col in high_outlier_vars[1:10]) { # Limit to top 10 for efficiency
+  if (col %in% names(application_test)) {
+    # Get bounds from outlier summary
+    lower <- outlier_summary$Lower_Bound[outlier_summary$Feature == col]
+    upper <- outlier_summary$Upper_Bound[outlier_summary$Feature == col]
+    
+    # Create flag for outliers
+    flag_name <- paste0(col, "_OUTLIER")
+    application_test[[flag_name]] <- ifelse(application_test[[col]] < lower | application_test[[col]] > upper, 1, 0)
+    
+    cat("Created outlier flag for", col, "- Number of outliers:", sum(application_test[[flag_name]], na.rm = TRUE), "\n")
+  }
+}
+
+
+# Check distributions after handling outliers for a key variable
+cat("\nVisualize distribution after handling outliers for", key_financial_vars[1], "\n")
+p <- ggplot(train, aes(x = .data[[key_financial_vars[1]]])) +
+  geom_histogram(fill = "green", alpha = 0.7, bins = 30) +
+  labs(title = paste("Distribution of", key_financial_vars[1], "After Capping"),
+       x = key_financial_vars[1],
+       y = "Count")
+print(p)
+
+# Compare original vs. flagged distribution for a high-outlier variable
+if (length(high_outlier_vars) > 0) {
+  outlier_var <- high_outlier_vars[1]
+  flag_var <- paste0(outlier_var, "_OUTLIER")
+  
+  cat("\nRelationship between", outlier_var, "outliers and target variable\n")
+  table_result <- table(train[[flag_var]], train$TARGET)
+  print(table_result)
+  
+  # Calculate proportion of defaults by outlier status
+  prop_table <- prop.table(table_result, margin = 1)
+  cat("\nProportion of defaults by outlier status:\n")
+  print(prop_table[,2])
+}
+
+```
+
+
+
+

@@ -1,0 +1,991 @@
+---
+title: "Home Credit - Modelling"
+author: "Shawal Fida"
+output:
+  html_document:
+    number_sections: true
+    toc: true
+  pdf_document:
+    toc: true
+  '': default
+editor_options:
+  chunk_output_type: console
+---
+
+# Introduction
+
+## Business Problem
+Home Credit Group aims to broaden financial inclusion for unbanked populations by providing a positive and safe borrowing experience. The key challenge is accurately predicting which loan applicants will be able to repay their loans. This prediction is critical because:
+
+1. Rejecting good applicants means lost business opportunities
+2. Approving high-risk applicants may lead to financial losses and increased default rates.
+3. Many potential customers lack conventional credit histories, making traditional scoring methods inadequate
+
+The company currently uses various statistical and machine learning methods to make these predictions but believes there's room for improvement. Our goal, and therefore the purpose of this notebook, is to develop a model that can more accurately identify which clients are capable of repayment, allowing Home Credit to make better-informed lending decisions.
+
+## Analytical Problem
+Customer repayment probability will be generated using a supervised machine-learning model. The model will use as inputs data collected on past customers such as application, demographic, and historical credit behavior. The model will use this information to predict the probability that the customers will either repay or not repay their loans. 
+
+## Evaluation Metric
+
+Model performance will be evaluated based on the Area Under the ROC Curve (AUC) between the predicted probability and the observed target. This metric is particularly suitable for this problem because:
+
+- It measures how well the model can distinguish between clients who will default and those who won't
+- It works well with imbalanced datasets (where one class is more common than the other)
+- It evaluates the quality of probability predictions rather than just binary classifications
+
+# Data Preparation
+
+## Package loading
+
+```{r setup, message = FALSE, warning = FALSE, results = 'hide'}
+
+# Set working directory
+mydir <- getwd()
+setwd(mydir)
+
+# List of required packages
+required_packages <- c("tidyverse", "janitor", "psych", "skimr", "pROC", "randomForest", "gbm", "C50", "caret")
+
+# Install any missing packages
+new_packages <- required_packages[!(required_packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load the packages
+lapply(required_packages, library, character.only = TRUE)
+```
+
+## Data Import
+
+```{r data loading, message = FALSE, warning = FALSE}
+
+application_train = read_csv("application_train.csv", col_names = TRUE, show_col_types = FALSE)
+application_test = read_csv("application_test.csv", col_names = TRUE, , show_col_types = FALSE)
+```
+
+## Dataset Structure and Summary
+
+```{r structure, message = FALSE, warning = FALSE, results = 'hide'}
+
+# Dataset structure
+str(application_train) 
+
+# Dataset summary
+summary(application_train) 
+
+```
+
+## Convert TARGET variable to a factor
+
+```{r factor target, message = FALSE, warning = FALSE}
+# Create a working copy of the dataset
+train <- application_train
+
+# Convert TARGET variable to a factor
+train$TARGET <- as.factor(train$TARGET)
+
+# Verify the conversion
+str(train$TARGET)
+table(train$TARGET)  # Check class distribution
+```
+
+## Missing Values Analysis
+
+```{r missing values, message = FALSE, warning = FALSE}
+
+# Function to calculate missing values
+missing_values <- function(df) {
+  mis_val <- colSums(is.na(df))
+  mis_val_percent <- (mis_val / nrow(df)) * 100
+  mis_table <- data.frame(Feature = names(mis_val),
+                         Missing_Values = mis_val,
+                         Percentage = mis_val_percent) %>%
+    filter(Missing_Values > 0) %>%
+    arrange(desc(Percentage))
+  
+  return(mis_table)
+}
+
+# Check missing values
+train_missing <- missing_values(train)
+test_missing <- missing_values(application_test)
+head(train_missing, 10)  # Display top 10 features with missing values
+
+# Plot missing values (Top 20)
+missing_values(train) %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(Feature, -Percentage), y = Percentage)) +
+  geom_bar(stat = "identity", fill = "red") +
+  coord_flip() +
+  labs(title = "Top 20 Features with Missing Values",
+       x = "Features",
+       y = "Percentage of Missing Values")
+
+# Dropping columns with more than 60% missing values
+
+# Define threshold
+threshold <- 0.60  # 60% missing values threshold
+
+# Calculate missing values percentage
+missing_values_ratio <- colSums(is.na(train)) / nrow(train)
+missing_values_test_ratio <- colSums(is.na(application_test)) / nrow(application_test)
+
+# Select columns to keep (less than 60% missing values)
+train <- train[, missing_values_ratio < threshold]
+application_test <- application_test[, missing_values_test_ratio < threshold]
+
+# Print remaining columns
+cat("Number of remaining columns after dropping:", ncol(train), "\n")
+
+
+# Handling remaining missing values
+
+# 1. Impute numeric columns with median
+num_cols <- names(train)[sapply(train, is.numeric)]
+num_cols_with_na <- names(which(sapply(train[num_cols], function(x) sum(is.na(x))) > 0))
+
+for (col in num_cols_with_na) {
+  med_val <- median(train[[col]], na.rm = TRUE)
+  train[[col]][is.na(train[[col]])] <- med_val
+}
+
+# Impute for test dataset
+num_cols_test <- names(application_test)[sapply(application_test, is.numeric)]
+num_cols_test_with_na <- names(which(sapply(application_test[num_cols_test], function(x) sum(is.na(x))) > 0))
+for (col in num_cols_test_with_na) {
+  med_val <- median(application_test[[col]], na.rm = TRUE)
+  application_test[[col]][is.na(application_test[[col]])] <- med_val
+}
+
+# 2. Impute categorical columns with most frequent value (mode)
+cat_cols <- names(train)[sapply(train, is.character) | sapply(train, is.factor)]
+cat_cols_with_na <- names(which(sapply(train[cat_cols], function(x) sum(is.na(x))) > 0))
+
+for (col in cat_cols_with_na) {
+  mode_val <- names(sort(table(train[[col]]), decreasing = TRUE))[1]
+  train[[col]][is.na(train[[col]])] <- mode_val
+}
+
+# Impute for testing dataset
+cat_cols_test <- names(application_test)[sapply(application_test, is.character) | sapply(application_test, is.factor)]
+cat_cols_test_with_na <- names(which(sapply(application_test[cat_cols_test], function(x) sum(is.na(x))) > 0))
+
+for (col in cat_cols_test_with_na) {
+  mode_val <- names(sort(table(application_test[[col]]), decreasing = TRUE))[1]
+  application_test[[col]][is.na(application_test[[col]])] <- mode_val
+}
+
+# Check if any missing values remain
+any_missing_train <- any(is.na(train))
+cat("Are there any missing values in train data?", any_missing_train, "\n")
+```
+
+## Outlier Analysis and Handling
+
+```{r outliers, message = FALSE, warning = FALSE}
+# Outlier Analysis and Handling
+
+# Identify numeric columns (excluding ID and target variable)
+num_cols <- names(train)[sapply(train, is.numeric)]
+num_cols <- num_cols[!num_cols %in% c("SK_ID_CURR", "TARGET")]
+
+# Function to detect outliers using IQR method
+identify_outliers <- function(x) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower_bound <- q1 - 1.5 * iqr
+  upper_bound <- q3 + 1.5 * iqr
+  return(list(
+    lower = lower_bound,
+    upper = upper_bound,
+    outliers = sum(x < lower_bound | x > upper_bound, na.rm = TRUE),
+    outlier_prop = sum(x < lower_bound | x > upper_bound, na.rm = TRUE) / length(x[!is.na(x)])
+  ))
+}
+
+# Calculate outliers for each numeric variable
+outlier_summary <- data.frame(
+  Feature = character(),
+  Lower_Bound = numeric(),
+  Upper_Bound = numeric(),
+  Outlier_Count = numeric(),
+  Outlier_Proportion = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (col in num_cols) {
+  if (length(unique(train[[col]])) > 1) { # Skip constant columns
+    outlier_info <- identify_outliers(train[[col]])
+    outlier_summary <- rbind(outlier_summary, data.frame(
+      Feature = col,
+      Lower_Bound = outlier_info$lower,
+      Upper_Bound = outlier_info$upper,
+      Outlier_Count = outlier_info$outliers,
+      Outlier_Proportion = outlier_info$outlier_prop,
+      stringsAsFactors = FALSE
+    ))
+  }
+}
+
+# Sort by proportion of outliers
+outlier_summary <- outlier_summary %>% arrange(desc(Outlier_Proportion))
+
+# Display top variables with outliers
+head(outlier_summary, 10)
+
+# Visualize distributions of top variables with outliers
+for (i in 1:min(5, nrow(outlier_summary))) {
+  col_name <- outlier_summary$Feature[i]
+  p <- ggplot(train, aes(x = .data[[col_name]])) +
+    geom_histogram(fill = "blue", alpha = 0.7, bins = 30) +
+    geom_vline(xintercept = outlier_summary$Lower_Bound[i], color = "red", linetype = "dashed") +
+    geom_vline(xintercept = outlier_summary$Upper_Bound[i], color = "red", linetype = "dashed") +
+    labs(title = paste("Distribution of", col_name),
+         subtitle = "Red lines show outlier thresholds",
+         x = col_name,
+         y = "Count")
+  print(p)
+}
+
+# **Handling Outliers**
+# Strategy 1: Capping (Winsorization) for key financial variables
+key_financial_vars <- c("AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY", "AMT_GOODS_PRICE")
+
+for (col in key_financial_vars) {
+  if (col %in% names(train)) {
+    # Calculate outlier bounds
+    q1 <- quantile(train[[col]], 0.25, na.rm = TRUE)
+    q3 <- quantile(train[[col]], 0.75, na.rm = TRUE)
+    iqr <- q3 - q1
+    lower_bound <- q1 - 1.5 * iqr
+    upper_bound <- q3 + 1.5 * iqr
+    
+    # Count values outside bounds
+    n_lower <- sum(train[[col]] < lower_bound, na.rm = TRUE)
+    n_upper <- sum(train[[col]] > upper_bound, na.rm = TRUE)
+    
+    # Apply capping
+    train[[col]] <- ifelse(train[[col]] < lower_bound, lower_bound, train[[col]])
+    train[[col]] <- ifelse(train[[col]] > upper_bound, upper_bound, train[[col]])
+    
+    cat("Capped", col, "- Values below lower bound:", n_lower, 
+        "- Values above upper bound:", n_upper, "\n")
+  }
+}
+
+## Do the same for testing dataset
+for (col in key_financial_vars) {
+  if (col %in% names(application_test)) {
+    # Calculate outlier bounds
+    q1 <- quantile(application_test[[col]], 0.25, na.rm = TRUE)
+    q3 <- quantile(application_test[[col]], 0.75, na.rm = TRUE)
+    iqr <- q3 - q1
+    lower_bound <- q1 - 1.5 * iqr
+    upper_bound <- q3 + 1.5 * iqr
+    
+    # Count values outside bounds
+    n_lower <- sum(application_test[[col]] < lower_bound, na.rm = TRUE)
+    n_upper <- sum(application_test[[col]] > upper_bound, na.rm = TRUE)
+    
+    # Apply capping
+    application_test[[col]] <- ifelse(application_test[[col]] < lower_bound, lower_bound, train[[col]])
+    application_test[[col]] <- ifelse(application_test[[col]] > upper_bound, upper_bound, train[[col]])
+    
+    cat("Capped", col, "- Values below lower bound:", n_lower, 
+        "- Values above upper bound:", n_upper, "\n")
+  }
+}
+
+# Strategy 2: Create binary flags for significant outliers in other variables
+# Select variables with high outlier proportion (> 40%)
+high_outlier_vars <- outlier_summary$Feature[outlier_summary$Outlier_Proportion > 0.4 & 
+                                             !outlier_summary$Feature %in% key_financial_vars]
+
+# Create flags for these variables
+for (col in high_outlier_vars[1:10]) { # Limit to top 10 for efficiency
+  if (col %in% names(train)) {
+    # Get bounds from outlier summary
+    lower <- outlier_summary$Lower_Bound[outlier_summary$Feature == col]
+    upper <- outlier_summary$Upper_Bound[outlier_summary$Feature == col]
+    
+    # Create flag for outliers
+    flag_name <- paste0(col, "_OUTLIER")
+    train[[flag_name]] <- ifelse(train[[col]] < lower | train[[col]] > upper, 1, 0)
+    
+    cat("Created outlier flag for", col, "- Number of outliers:", sum(application_test[[flag_name]], na.rm = TRUE), "\n")
+  }
+}
+
+# do same for testing dataset
+for (col in high_outlier_vars[1:10]) { # Limit to top 10 for efficiency
+  if (col %in% names(application_test)) {
+    # Get bounds from outlier summary
+    lower <- outlier_summary$Lower_Bound[outlier_summary$Feature == col]
+    upper <- outlier_summary$Upper_Bound[outlier_summary$Feature == col]
+    
+    # Create flag for outliers
+    flag_name <- paste0(col, "_OUTLIER")
+    application_test[[flag_name]] <- ifelse(application_test[[col]] < lower | application_test[[col]] > upper, 1, 0)
+    
+    cat("Created outlier flag for", col, "- Number of outliers:", sum(application_test[[flag_name]], na.rm = TRUE), "\n")
+  }
+}
+
+
+# Check distributions after handling outliers for a key variable
+cat("\nVisualize distribution after handling outliers for", key_financial_vars[1], "\n")
+p <- ggplot(train, aes(x = .data[[key_financial_vars[1]]])) +
+  geom_histogram(fill = "green", alpha = 0.7, bins = 30) +
+  labs(title = paste("Distribution of", key_financial_vars[1], "After Capping"),
+       x = key_financial_vars[1],
+       y = "Count")
+print(p)
+
+# Compare original vs. flagged distribution for a high-outlier variable
+if (length(high_outlier_vars) > 0) {
+  outlier_var <- high_outlier_vars[1]
+  flag_var <- paste0(outlier_var, "_OUTLIER")
+  
+  cat("\nRelationship between", outlier_var, "outliers and target variable\n")
+  table_result <- table(train[[flag_var]], train$TARGET)
+  print(table_result)
+  
+  # Calculate proportion of defaults by outlier status
+  prop_table <- prop.table(table_result, margin = 1)
+  cat("\nProportion of defaults by outlier status:\n")
+  print(prop_table[,2])
+}
+
+```
+
+## Convert Categorical Variables to Factors
+
+```{r factoring, message = FALSE, warning = FALSE}
+
+# get rid of commas in these columns so C50 model runs
+train$ORGANIZATION_TYPE <- gsub(":", "", train$ORGANIZATION_TYPE)
+train$WALLSMATERIAL_MODE <- gsub(",", " and", train$WALLSMATERIAL_MODE)
+train$NAME_TYPE_SUITE <- gsub(",", " and", train$NAME_TYPE_SUITE)
+
+application_test$ORGANIZATION_TYPE <- gsub(":", "", application_test$ORGANIZATION_TYPE)
+application_test$WALLSMATERIAL_MODE <- gsub(",", " and", application_test$WALLSMATERIAL_MODE)
+application_test$NAME_TYPE_SUITE <- gsub(",", " and", application_test$NAME_TYPE_SUITE)
+
+# Convert Categorical Variables to Factors
+
+# Identify categorical variables (excluding the ID column)
+cat_cols <- names(train)[sapply(train, is.character) | sapply(train, is.factor)]
+cat_cols <- setdiff(cat_cols, "SK_ID_CURR") # Exclude ID column if present
+
+# Convert to factors
+for (col in cat_cols) {
+  train[[col]] <- as.factor(train[[col]])
+}
+
+# Convert test to factors
+cat_test_cols <- names(application_test)[sapply(application_test, is.character) | sapply(application_test, is.factor)]
+cat_test_cols <- setdiff(cat_test_cols, "SK_ID_CURR")
+for (col in cat_test_cols) {
+  application_test[[col]] <- as.factor(application_test[[col]])
+}
+
+
+
+# Verify conversion
+str(train[, cat_cols])  # Check structure of categorical columns
+
+str(application_test[, cat_test_cols])
+```
+
+## Feature Engineering
+
+```{r feature engineering, message = FALSE, warning = FALSE}
+
+# Creating new features
+
+# Credit-to-Income Ratio
+train$CREDIT_INCOME_RATIO <- train$AMT_CREDIT / train$AMT_INCOME_TOTAL
+application_test$CREDIT_INCOME_RATIO <- application_test$AMT_CREDIT / application_test$AMT_INCOME_TOTAL
+
+# Annuity-to-Income Ratio (Debt-to-Income)
+train$ANNUITY_INCOME_RATIO <- train$AMT_ANNUITY / train$AMT_INCOME_TOTAL
+application_test$ANNUITY_INCOME_RATIO <- application_test$AMT_ANNUITY / application_test$AMT_INCOME_TOTAL
+
+# Credit-to-Goods Price Ratio (Loan-to-Value)
+train$CREDIT_GOODS_RATIO <- train$AMT_CREDIT / train$AMT_GOODS_PRICE
+application_test$CREDIT_GOODS_RATIO <- application_test$AMT_ANNUITY / application_test$AMT_INCOME_TOTAL
+
+# Income Per Family Member
+train$INCOME_PER_PERSON <- train$AMT_INCOME_TOTAL / (1 + train$CNT_FAM_MEMBERS)
+application_test$INCOME_PER_PERSON <- application_test$AMT_INCOME_TOTAL / (1 + application_test$CNT_FAM_MEMBERS)
+
+# Age in Years
+train$AGE_YEARS <- abs(train$DAYS_BIRTH) / 365.25
+application_test$AGE_YEARS <- abs(application_test$DAYS_BIRTH) / 365.25
+
+# Employment Duration in Years
+train$DAYS_EMPLOYED_ANOM <- train$DAYS_EMPLOYED == 365243  # Identify anomaly
+# factor to work with C50 model
+train$DAYS_EMPLOYED_ANOM <- factor(train$DAYS_EMPLOYED_ANOM, levels = c(FALSE, TRUE), labels = c("0", "1"))
+train$DAYS_EMPLOYED[train$DAYS_EMPLOYED_ANOM] <- NA  # Replace anomaly with NA
+train$DAYS_EMPLOYED[is.na(train$DAYS_EMPLOYED)] <- median(train$DAYS_EMPLOYED, na.rm = TRUE)
+train$YEARS_EMPLOYED <- abs(train$DAYS_EMPLOYED) / 365.25  # Convert to years
+train$YEARS_EMPLOYED[is.na(train$YEARS_EMPLOYED)] <- median(train$YEARS_EMPLOYED, na.rm = TRUE)  # Impute missing
+
+application_test$DAYS_EMPLOYED_ANOM <- application_test$DAYS_EMPLOYED == 365243  # Identify anomaly
+application_test$DAYS_EMPLOYED_ANOM <- factor(application_test$DAYS_EMPLOYED_ANOM, levels = c(FALSE, TRUE), labels = c("0", "1"))
+application_test$DAYS_EMPLOYED[application_test$DAYS_EMPLOYED_ANOM] <- NA  # Replace anomaly with NA
+application_test$DAYS_EMPLOYED[is.na(application_test$DAYS_EMPLOYED)] <- median(application_test$DAYS_EMPLOYED, na.rm = TRUE)
+application_test$YEARS_EMPLOYED <- abs(application_test$DAYS_EMPLOYED) / 365.25  # Convert to years
+application_test$YEARS_EMPLOYED[is.na(application_test$YEARS_EMPLOYED)] <- median(application_test$YEARS_EMPLOYED, na.rm = TRUE)
+
+# Employment-to-Age Ratio
+train$EMPLOYED_TO_AGE_RATIO <- train$YEARS_EMPLOYED / train$AGE_YEARS
+application_test$EMPLOYED_TO_AGE_RATIO <- application_test$YEARS_EMPLOYED / application_test$AGE_YEARS
+
+# Document Count (Summing flags for document presence)
+train$DOCUMENT_COUNT <- rowSums(train[, grep("FLAG_DOCUMENT", names(train))])
+application_test$DOCUMENT_COUNT <- rowSums(application_test[, grep("FLAG_DOCUMENT", names(application_test))])
+
+# Contact Information Count (Summing presence of different contact methods)
+train$CONTACT_COUNT <- rowSums(train[, grep("FLAG_MOBIL|FLAG_EMP_PHONE|FLAG_WORK_PHONE|FLAG_CONT_MOBILE|FLAG_PHONE|FLAG_EMAIL", names(train))])
+application_test$CONTACT_COUNT <- rowSums(application_test[, grep("FLAG_MOBIL|FLAG_EMP_PHONE|FLAG_WORK_PHONE|FLAG_CONT_MOBILE|FLAG_PHONE|FLAG_EMAIL", names(application_test))])
+
+# External Source Score Average (if available)
+ext_source_cols <- grep("^EXT_SOURCE", names(train), value = TRUE)
+if (length(ext_source_cols) > 0) {
+  train$EXT_SOURCE_MEAN <- rowMeans(train[, ext_source_cols], na.rm = TRUE)
+  train$EXT_SOURCE_MEAN[is.na(train$EXT_SOURCE_MEAN)] <- mean(train$EXT_SOURCE_MEAN, na.rm = TRUE)  # Impute missing
+}
+
+ext_source_test_cols <- grep("^EXT_SOURCE", names(application_test), value = TRUE)
+if (length(ext_source_test_cols) > 0) {
+  application_test$EXT_SOURCE_MEAN <- rowMeans(application_test[, ext_source_test_cols], na.rm = TRUE)
+  application_test$EXT_SOURCE_MEAN[is.na(application_test$EXT_SOURCE_MEAN)] <- mean(application_test$EXT_SOURCE_MEAN, na.rm = TRUE)  # Impute missing
+}
+
+# Bucketing Continuous Variables
+
+# **Bucketing EXT_SOURCE_MEAN**
+train$EXT_SOURCE_BUCKET <- cut(train$EXT_SOURCE_MEAN, 
+                               breaks = quantile(train$EXT_SOURCE_MEAN, probs = seq(0, 1, 0.20), na.rm = TRUE),
+                               labels = c("Very Low", "Low", "Medium", "High", "Very High"),
+                               include.lowest = TRUE)
+application_test$EXT_SOURCE_BUCKET <- cut(application_test$EXT_SOURCE_MEAN, 
+                               breaks = quantile(application_test$EXT_SOURCE_MEAN, probs = seq(0, 1, 0.20), na.rm = TRUE),
+                               labels = c("Very Low", "Low", "Medium", "High", "Very High"),
+                               include.lowest = TRUE)
+
+# **Age Groups**
+train$AGE_GROUP <- cut(train$AGE_YEARS, 
+                       breaks = c(20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 100),
+                       labels = c("20-25", "25-30", "30-35", "35-40", "40-45", 
+                                  "45-50", "50-55", "55-60", "60-65", "65+"))
+application_test$AGE_GROUP <- cut(application_test$AGE_YEARS, 
+                       breaks = c(20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 100),
+                       labels = c("20-25", "25-30", "30-35", "35-40", "40-45", 
+                                  "45-50", "50-55", "55-60", "60-65", "65+"))
+
+# **Income Groups**
+income_breaks <- quantile(train$AMT_INCOME_TOTAL, probs = seq(0, 1, 0.20), na.rm = TRUE)
+train$INCOME_GROUP <- cut(train$AMT_INCOME_TOTAL, 
+                          breaks = income_breaks,
+                          labels = c("Very Low", "Low", "Medium", "High", "Very High"), 
+                          include.lowest = TRUE)
+
+income_test_breaks <- quantile(application_test$AMT_INCOME_TOTAL, probs = seq(0, 1, 0.20), na.rm = TRUE)
+application_test$INCOME_GROUP <- cut(application_test$AMT_INCOME_TOTAL, 
+                          breaks = income_test_breaks,
+                          labels = c("Very Low", "Low", "Medium", "High", "Very High"), 
+                          include.lowest = TRUE)
+
+# **Credit Amount Groups**
+credit_breaks <- quantile(train$AMT_CREDIT, probs = seq(0, 1, 0.20), na.rm = TRUE)
+train$CREDIT_GROUP <- cut(train$AMT_CREDIT, 
+                          breaks = credit_breaks,
+                          labels = c("Very Low", "Low", "Medium", "High", "Very High"), 
+                          include.lowest = TRUE)
+
+credit_test_breaks <- quantile(application_test$AMT_CREDIT, probs = seq(0, 1, 0.20), na.rm = TRUE)
+application_test$CREDIT_GROUP <- cut(application_test$AMT_CREDIT, 
+                          breaks = credit_test_breaks ,
+                          labels = c("Very Low", "Low", "Medium", "High", "Very High"), 
+                          include.lowest = TRUE)
+
+
+# Verify Feature Engineering
+cat("Feature Engineering Complete. Summary:\n")
+summary(train[, c("CREDIT_INCOME_RATIO", "ANNUITY_INCOME_RATIO", "CREDIT_GOODS_RATIO",
+                  "INCOME_PER_PERSON", "AGE_YEARS", "YEARS_EMPLOYED", "EMPLOYED_TO_AGE_RATIO",
+                  "DOCUMENT_COUNT", "CONTACT_COUNT", "EXT_SOURCE_MEAN", "EXT_SOURCE_BUCKET")])
+```
+
+
+# Modeling
+
+## Prepare Training and Validation Sets
+
+```{r modeling prep, message = FALSE, warning = FALSE}
+# Split data into training (80%) and validation (20%)
+set.seed(42)  # For reproducibility
+
+train_index <- createDataPartition(train$TARGET, p = 0.8, list = FALSE)
+train_set <- train[train_index, ]
+valid_set <- train[-train_index, ]
+
+cat("Training set size:", nrow(train_set), "\n")
+cat("Validation set size:", nrow(valid_set), "\n")
+
+```
+
+The training and validation sets are how we will test the models and their performance.
+Fitting the model with the training set and then the validation set will be used
+to estimate how well the model has been trained, while also helping us see if there
+is any over or under fitting in our models. 
+
+## Establish Baseline Performance
+
+```{r baseline performance, message = FALSE, warning = FALSE}
+# Find the majority class
+majority_class <- as.numeric(names(which.max(table(train_set$TARGET))))
+cat("Majority class:", majority_class, "\n")  # Should print 0
+
+# Predict majority class for validation set
+baseline_preds <- rep(majority_class, nrow(valid_set))
+
+# Check predictions
+table(baseline_preds)  # Should show all as 0
+
+# Evaluate baseline accuracy
+baseline_accuracy <- mean(baseline_preds == as.numeric(as.character(valid_set$TARGET)))
+cat("Baseline Model Accuracy:", baseline_accuracy, "\n")
+
+# Convert predictions for AUC calculation
+baseline_roc <- roc(as.numeric(as.character(valid_set$TARGET)), baseline_preds)
+cat("Baseline Model AUC:", auc(baseline_roc), "\n")
+```
+
+This benchmark model predicts the majority class, or 0, for every prediction. This
+model gives us a minimum performance standard to help us know if our more sophisticated
+models are improving on this benchmark model. While it has 92% accuracy, it only
+has an AUC  of .5, thus giving us our benchmark for other models.  <br>
+
+We are going to try three different types of models. First, a logistic regression model,
+followed by a decision tree and then a random forest. These models were chosen due 
+to their simplicity, ease of use, and being easier to interpret, while also being able
+to handle the relationships between variables. 
+
+## Fit a Logistic Regression Model 
+
+```{r logistic regression, message = FALSE, warning = FALSE}
+# Define the formula for logistic regression
+logit_formula <- TARGET ~ CREDIT_INCOME_RATIO + ANNUITY_INCOME_RATIO + CREDIT_GOODS_RATIO +
+                 INCOME_PER_PERSON + AGE_YEARS + YEARS_EMPLOYED + EMPLOYED_TO_AGE_RATIO +
+                 DOCUMENT_COUNT + CONTACT_COUNT + EXT_SOURCE_MEAN
+
+# Train the logistic regression model
+logit_model <- glm(logit_formula, data = train_set, family = binomial)
+
+# Make predictions on training set
+logit_train_preds <- predict(logit_model, newdata = train_set, type = "response")
+logit_class_train_preds <- ifelse(logit_train_preds > 0.5, 1, 0)
+logit_train_roc <- roc(as.numeric(as.character(train_set$TARGET)), logit_train_preds)
+cat("Logistic Regression AUC:", auc(logit_train_roc), "\n")
+
+# Make predictions on validation set
+logit_preds <- predict(logit_model, newdata = valid_set, type = "response")
+
+# Convert probabilities to class labels (threshold = 0.5)
+logit_class_preds <- ifelse(logit_preds > 0.5, 1, 0)
+
+# Evaluate accuracy
+logit_accuracy <- mean(logit_class_preds == as.numeric(as.character(valid_set$TARGET)))
+cat("Logistic Regression Accuracy:", logit_accuracy, "\n")
+
+# Compute AUC
+logit_roc <- roc(as.numeric(as.character(valid_set$TARGET)), logit_preds)
+cat("Logistic Regression AUC:", auc(logit_roc), "\n")
+
+# View model summary
+summary(logit_model)
+
+# Confusion Matrix
+# Test
+predictions <- as.numeric(logit_train_preds>0.5)
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = train_set$TARGET)
+
+# Validate
+predictions <- as.numeric(logit_preds>0.5)
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+
+# Validate using > 0.1
+predictions <- as.numeric(logit_preds>0.1)
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+```
+
+This logistic regression model is a simple model to get results for before possibly moving on to more complex models. The model was created using only the numeric, featured engineered
+columns we created earlier in this notebook. 
+
+The logistic regression model achieved:
+
+-	Accuracy: 91.92%
+-	AUC: 0.7339
+
+This means the model is performing significantly better than the baseline (AUC = 0.5). 
+
+Significant Predictors (p-value < 0.05):
+
+-	CREDIT_INCOME_RATIO (negative impact on default likelihood)
+-	ANNUITY_INCOME_RATIO (positive impact)
+-	CREDIT_GOODS_RATIO (positive impact)
+-	INCOME_PER_PERSON (positive impact)
+-	AGE_YEARS (negative impact)
+-	EMPLOYED_TO_AGE_RATIO (negative impact)
+-	CONTACT_COUNT (positive impact)
+-	EXT_SOURCE_MEAN (strongest negative impact on default likelihood)
+	
+Not Significant:
+
+-	YEARS_EMPLOYED (p = 0.91) → Likely not useful
+-	DOCUMENT_COUNT (p = 0.38) → Could be dropped or modified
+
+With a deeper look at the outcomes using a confusion matrix, we see that while accuracy
+is quite high, the number of false positives are significant. By lowering the value
+of the separating threshold, we see an increase in correctly predicted clients who
+have had trouble with payments, but at a cost of providing an increased number of
+false negatives. Accuracy reduced from the above 91.92% to 75.89%, but balanced
+accuracy increased from 50.29% to 66.62%.
+	
+	
+### Adding Interaction Terms 
+
+```{r interaction terms, message = FALSE, warning = FALSE}
+logit_formula_interaction <- TARGET ~ CREDIT_INCOME_RATIO * AGE_YEARS +
+                             ANNUITY_INCOME_RATIO * EMPLOYED_TO_AGE_RATIO +
+                             CREDIT_GOODS_RATIO + INCOME_PER_PERSON +
+                             CONTACT_COUNT + EXT_SOURCE_MEAN
+logit_model_interaction <- glm(logit_formula_interaction, data = train_set, family = binomial)
+```
+
+```{r interaction results, message = FALSE, warning = FALSE}
+# Predict on training set
+interaction_train_preds <- predict(logit_model_interaction, train_set, type = "response")
+interaction_train_preds_binary <- ifelse(interaction_train_preds > 0.5, 1, 0)
+interaction_train_roc <- roc(as.numeric(as.character(train_set$TARGET)), interaction_train_preds)
+cat("Logistic Regression with Interaction AUC:", auc(interaction_train_roc), "\n")
+
+# Predict on validation set
+interaction_preds <- predict(logit_model_interaction, valid_set, type = "response")
+
+# Convert predictions to binary (threshold 0.5)
+interaction_preds_binary <- ifelse(interaction_preds > 0.5, 1, 0)
+
+# Calculate Accuracy
+interaction_accuracy <- mean(interaction_preds_binary == as.numeric(as.character(valid_set$TARGET)))
+cat("Logistic Regression with Interaction Accuracy:", interaction_accuracy, "\n")
+
+# Compute AUC
+interaction_roc <- roc(as.numeric(as.character(valid_set$TARGET)), interaction_preds)
+cat("Logistic Regression with Interaction AUC:", auc(interaction_roc), "\n")
+```
+
+Since adding interaction terms did not significantly improve AUC (0.7339 vs 0.7343),
+the interactions might be unnecessary. Let’s refine the model by:
+
+Dropping Insignificant Features (p > 0.05)
+
+From the previous logistic regression output, these features had high p-values:
+
+- YEARS_EMPLOYED (p = 0.917691)
+- DOCUMENT_COUNT (p = 0.379925)
+	
+```{r new logit formula, message = FALSE, warning = FALSE}
+# New formula without non-significant features
+logit_formula_selected <- TARGET ~ CREDIT_INCOME_RATIO + ANNUITY_INCOME_RATIO + 
+                          CREDIT_GOODS_RATIO + INCOME_PER_PERSON + AGE_YEARS +
+                          EMPLOYED_TO_AGE_RATIO + CONTACT_COUNT + EXT_SOURCE_MEAN
+
+# Train model again
+logit_model_selected <- glm(logit_formula_selected, data = train_set, family = binomial)
+
+
+# Predict on training set
+trained_preds <- predict(logit_model_selected, train_set, type = "response")
+trained_preds_binary <- ifelse(trained_preds > 0.5, 1, 0)
+trained_roc <- roc(as.numeric(as.character(train_set$TARGET)), trained_preds)
+cat("Logistic Regression (Feature Selected) AUC:", auc(trained_roc), "\n")
+
+# Predict on validation set
+selected_preds <- predict(logit_model_selected, valid_set, type = "response")
+selected_preds_binary <- ifelse(selected_preds > 0.5, 1, 0)
+
+# Calculate Accuracy
+selected_accuracy <- mean(selected_preds_binary == as.numeric(as.character(valid_set$TARGET)))
+cat("Logistic Regression (Feature Selected) Accuracy:", selected_accuracy, "\n")
+
+# Compute AUC
+selected_roc <- roc(as.numeric(as.character(valid_set$TARGET)), selected_preds)
+cat("Logistic Regression (Feature Selected) AUC:", auc(selected_roc), "\n")
+
+# Confusion Matrix
+# Test
+predictions <- as.numeric(trained_preds>0.5)
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = train_set$TARGET)
+
+# Validate
+predictions <- as.numeric(selected_preds>0.5)
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+
+# Validate > 0.1
+predictions <- as.numeric(selected_preds>0.1)
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+```
+
+
+Since feature selection did not significantly improve AUC (0.7343 vs 0.734), we'll
+try our other models that potentially handle more complex relationships better.
+
+## Decision tree model
+
+```{r decision tree, message = FALSE, warning = FALSE}
+# create model, will use CF to fine tune
+tree_cf_1 <- C5.0(train_set$TARGET ~. -SK_ID_CURR, train_set, control = C5.0Control(CF= .4, earlyStopping = FALSE, noGlobalPruning = FALSE))
+
+# create predictions for training set
+tree_cf_1_train_predictions <- predict(tree_cf_1,train_set, type = "prob")
+train_positive_probs <- tree_cf_1_train_predictions[, "1"]
+
+# finding auc score for training set
+train_roc <- roc(train_set$TARGET, train_positive_probs)  
+train_auc <- auc(train_roc) 
+train_auc
+
+# create predictions for validation set
+tree_cf_1_valid_predictions <- predict(tree_cf_1,valid_set, type = "prob")
+valid_positive_probs <- tree_cf_1_valid_predictions[, "1"]
+valid_roc <- roc(valid_set$TARGET, valid_positive_probs)  
+valid_auc <- auc(valid_roc) 
+valid_auc
+
+# adjusting CF to lower value to see if more generalized model helps
+tree_cf_2 <- C5.0(train_set$TARGET ~. -SK_ID_CURR, train_set, control = C5.0Control(CF= .1, earlyStopping = FALSE, noGlobalPruning = FALSE))
+
+# create predictions for training set
+tree_cf_2_train_predictions <- predict(tree_cf_2,train_set, type = "prob")
+train_positive_probs_2 <- tree_cf_2_train_predictions[, "1"]
+
+# finding auc score for training set
+train_roc_2 <- roc(train_set$TARGET, train_positive_probs_2)  
+train_auc_2 <- auc(train_roc_2) 
+train_auc_2
+
+# create predictions for validation set
+tree_cf_2_valid_predictions <- predict(tree_cf_2,valid_set, type = "prob")
+valid_positive_probs_2 <- tree_cf_2_valid_predictions[, "1"]
+valid_roc_2 <- roc(valid_set$TARGET, valid_positive_probs_2)  
+valid_auc_2 <- auc(valid_roc_2) 
+valid_auc_2
+
+# dropping CF made it worse, try increasing CF
+tree_cf_3 <- C5.0(train_set$TARGET ~. -SK_ID_CURR, train_set, control = C5.0Control(CF= .8, earlyStopping = FALSE, noGlobalPruning = FALSE))
+
+# create predictions for training set
+tree_cf_3_train_predictions <- predict(tree_cf_3,train_set, type = "prob")
+train_positive_probs_3 <- tree_cf_3_train_predictions[, "1"]
+
+# finding auc score for training set
+train_roc_3 <- roc(train_set$TARGET, train_positive_probs_3)  
+train_auc_3 <- auc(train_roc_3) 
+train_auc_3
+
+# create predictions for validation set
+tree_cf_3_valid_predictions <- predict(tree_cf_3,valid_set, type = "prob")
+valid_positive_probs_3 <- tree_cf_3_valid_predictions[, "1"]
+valid_roc_3 <- roc(valid_set$TARGET, valid_positive_probs_3)  
+valid_auc_3 <- auc(valid_roc_3) 
+valid_auc_3
+
+# Confusion Matrices
+# Test 1
+predictions <- as.factor(ifelse(train_positive_probs > 0.5, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = train_set$TARGET)
+
+# Validate 1
+predictions <- as.factor(ifelse(valid_positive_probs > 0.5, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+
+# Test 2
+predictions <- as.factor(ifelse(train_positive_probs_2 > 0.5, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = train_set$TARGET)
+
+# Validate 2
+predictions <- as.factor(ifelse(valid_positive_probs_2 > 0.5, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+
+# Test 3
+predictions <- as.factor(ifelse(train_positive_probs_3 > 0.5, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = train_set$TARGET)
+
+# Validate 3
+predictions <- as.factor(ifelse(valid_positive_probs_3 > 0.5, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+
+# Validate 3 with different >
+predictions <- as.factor(ifelse(valid_positive_probs_3 > 0.1, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+```
+
+
+### Decision tree with weights
+```{r dt weights, message = FALSE, warning = FALSE}
+ # Assign higher weight to 1, the minority class
+weights <- ifelse(train_set$TARGET == "1", 3, 1)
+
+#  create model with weights
+tree_cf_weighted <- C5.0(train_set$TARGET ~ . -SK_ID_CURR, data = train_set, weights = weights)
+# predictions for training set
+tree_cf_weighted_predictions <- predict(tree_cf_weighted,train_set, type = "prob")
+
+# calculating auc for training set
+train_weighted_positive_probs <- tree_cf_weighted_predictions[, "1"]
+train_weight_roc <- roc(train_set$TARGET, train_weighted_positive_probs)  
+train_weight_auc <- auc(train_weight_roc)
+train_weight_auc
+
+# predictions for validation set
+tree_cf_valid_predictions <- predict(tree_cf_weighted,valid_set, type = "prob")
+# auc for validation set
+valid_weight_probs <- tree_cf_valid_predictions[, "1"]
+valid_weight_roc <- roc(valid_set$TARGET, valid_weight_probs)  
+valid_weight_auc <- auc(valid_weight_roc) 
+valid_weight_auc
+
+# Confusion Matrices
+# Test
+predictions <- as.factor(ifelse(train_weighted_positive_probs > 0.5, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = train_set$TARGET)
+
+# Validate
+predictions <- as.factor(ifelse(valid_weight_probs > 0.5, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+
+# Validate > 0.1
+predictions <- as.factor(ifelse(valid_weight_probs > 0.1, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+```
+
+The decision tree with weights had a training AUC of .9904, with a validation AUC of .61.
+This weights made the model way too overfitted to the training data. Adding in the
+confusion matrix shows the overfitting more clearly as the training set is extremely
+accurate, but the validation set is no more accurate than the previous models. We
+see a balanced accuracy of 55.72% in the validation data, which is on slightly 
+better than the previous model performance. Unlike the previous models, however,
+reducing the threshold to 0.1 does not significantly improve performance. <br>
+
+Overall, these models all took about 3 minutes to train, and none of them performed 
+better than logistic regression. We will go on to the random forest to see if this
+can capture more of the complex relationships that exist in this dataset. 
+
+## Random Forest
+```{r Random Forest, message = FALSE, warning = FALSE}
+# Rf can't handle over 53 different categorical types, take out organization type
+tree_rf <- randomForest(TARGET ~ . - SK_ID_CURR - ORGANIZATION_TYPE, 
+                        data = train_set, 
+                        ntree = 100,
+                        nodesize = 10)  
+
+tree_rf_preds <- predict(tree_rf, type = "prob")
+
+# calculating auc for training set
+train_rf_positive_probs <- tree_rf_preds[, "1"]
+train_rf_roc <- roc(train_set$TARGET, train_rf_positive_probs)  
+train_rf_auc <- auc(train_rf_roc)
+train_rf_auc
+
+# predictions for validation set
+tree_rf_valid_predictions <- predict(tree_rf,valid_set, type = "prob")
+# auc for validation set
+valid_rf_probs <- tree_rf_valid_predictions[, "1"]
+valid_rf_roc <- roc(valid_set$TARGET, valid_rf_probs)  
+valid_rf_auc <- auc(valid_rf_roc) 
+valid_rf_auc
+
+# try increasing tree size
+tree_rf_1 <- randomForest(TARGET ~ . - SK_ID_CURR - ORGANIZATION_TYPE, 
+                        data = train_set, 
+                        ntree = 200,
+                        nodesize = 10)  
+
+tree_rf_1_preds <- predict(tree_rf_1, type = "prob")
+
+# calculating auc for training set
+train_rf_1_probs <- tree_rf_1_preds[, "1"]
+train_rf_1_roc <- roc(train_set$TARGET, train_rf_1_probs)  
+train_rf_1_auc <- auc(train_rf_1_roc)
+train_rf_1_auc
+
+# predictions for validation set
+tree_rf_valid_1 <- predict(tree_rf_1,valid_set, type = "prob")
+# auc for validation set
+valid_rf_1_probs <- tree_rf_valid_1[, "1"]
+valid_rf_1_roc <- roc(valid_set$TARGET, valid_rf_1_probs)  
+valid_rf_1_auc <- auc(valid_rf_1_roc) 
+valid_rf_1_auc
+
+# Confusion Matrices
+# Test
+predictions <- as.factor(ifelse(train_rf_1_probs > 0.5, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = train_set$TARGET)
+
+# Validate
+predictions <- as.factor(ifelse(valid_rf_1_probs > 0.5, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+
+# Validate > 0.1
+predictions <- as.factor(ifelse(valid_rf_1_probs > 0.1, 1, 0))
+predictions <- factor(predictions, levels = c(0,1))
+confusionMatrix(data = predictions, reference = valid_set$TARGET)
+```
+
+Overall, the random forest models performed better than the decision trees, but did not improve upon
+what the logistic regression models did, especially when factoring in the computing
+time.
+
+
+# Testing dataset predictions
+
+```{r testing dataset predictions, message = FALSE, warning = FALSE}
+# Use logistic regression as it performed quickest and matched random forest in performance
+# keep sk_id_curr out of predictions
+logit_test_preds <- predict(logit_model, newdata = application_test[, setdiff(names(application_test), "sk_id_curr")], type = "response")
+
+submission_df <- data.frame(
+  SK_ID_CURR = as.integer(application_test$SK_ID_CURR),  
+  TARGET = logit_test_preds                   
+)
+
+write.csv(submission_df, "submission.csv", row.names = FALSE)
+```
+
+# Model Performance
+I chose to use the first logistic regression model for my Kaggle submission because it delivered the best performance in terms of AUC, computation time, and ease of interpretation. The model trained very quickly, taking only a few seconds to run. It also demonstrated good accuracy in predicting individuals who are unlikely to experience payment difficulties, although it was more biased towards this prediction, leading to a higher number of false positives. By adjusting the threshold values, I found that lowering the threshold reduced the number of false positives compared to using a higher threshold. The random forest model, with a threshold of 0.1, achieved the highest balanced accuracy of 66.96%. Overall, the logistic regression model achieved a training AUC of 0.7246 and a validation AUC of 0.7339.
+
